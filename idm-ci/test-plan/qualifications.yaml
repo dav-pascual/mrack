@@ -15,6 +15,7 @@ qualifications:
         jobs:
           - junit-success
           - junit-failure
+          - error
     triggers:
       - github_pr:
           target_branch: main
