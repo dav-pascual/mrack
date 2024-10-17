@@ -34,6 +34,10 @@ class Podman:
 
     async def _run_podman(self, args, raise_on_err=True):
         """Util method to execute podman process."""
+        logger.debug(
+            f"Running container with command:\n\t{' '.join([self.program] + args)}"
+        )
+
         try:
             return await exec_async_subprocess(self.program, args, raise_on_err)
         except ProvisioningError as p_error:
