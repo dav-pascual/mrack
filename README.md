@@ -305,3 +305,5 @@ $ make test
 
 
 <!-- idm-ci fedora-messaging listener test -->
+
+<!-- retest: fixes for copr_chroot + Packit URL regex -->
