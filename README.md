@@ -302,3 +302,6 @@ $ tox
 # or use make
 $ make test
 ```
+
+
+<!-- idm-ci fedora-messaging listener test -->
