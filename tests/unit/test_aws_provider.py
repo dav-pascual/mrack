@@ -1,10 +1,12 @@
-"""Tests for AWS Provider - SSM parameter image resolution."""
+"""Tests for AWS Provider."""
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mrack.errors import ValidationError
+from mrack.context import global_context
+from mrack.errors import ProviderNotExists, ValidationError
 from mrack.providers.aws import AWSProvider
 
 
@@ -196,3 +198,153 @@ class TestLoadImageSSM:
             Filters=[{"Name": "image-id", "Values": ["ami-direct"]}]
         )
         assert result is mock_ami
+
+
+class MockSubnet:
+    """Mock AWS Subnet object."""
+
+    def __init__(self, available, mask="24"):
+        self.available_ip_address_count = available
+        self.cidr_block = f"10.0.0.0/{mask}"
+
+
+def mock_subnets(provider, subnets):
+    """Wire provider.ec2.Subnet(subnet_id) to return mocked subnets by id."""
+    provider.ec2.Subnet.side_effect = lambda subnet_id: subnets[subnet_id]
+
+
+def init_global_context(mrack_conf="mrack.conf"):
+    """Init global mrack config from one of the tests/unit/conf fixtures."""
+    try:
+        global_context.init(
+            os.path.join(
+                os.path.dirname(os.path.realpath(__file__)),
+                f"conf/{mrack_conf}",
+            ),
+            os.path.join(
+                os.path.dirname(os.path.realpath(__file__)),
+                "conf/provisioning-config.yaml",
+            ),
+        )
+    except ProviderNotExists:
+        assert global_context.CONFIG is not None
+
+
+def awshost(name, subnet_ids):
+    return {"name": name, "subnet_ids": list(subnet_ids)}
+
+
+class TestResolveSubnetGroups:
+    """Test AWSProvider._resolve_subnet_groups network-spread resolution."""
+
+    @pytest.mark.asyncio
+    async def test_group_fits_on_one_subnet_pins_to_best(self, provider):
+        init_global_context("mrack.conf")
+        mock_subnets(
+            provider,
+            {
+                "subnet-a": MockSubnet(available=50),
+                "subnet-b": MockSubnet(available=80),
+            },
+        )
+
+        hosts = [
+            awshost("h1", ["subnet-a", "subnet-b"]),
+            awshost("h2", ["subnet-a", "subnet-b"]),
+        ]
+        await provider.validate_hosts(hosts)
+
+        assert hosts[0]["subnet_ids"] == ["subnet-b"]
+        assert hosts[1]["subnet_ids"] == ["subnet-b"]
+
+    @pytest.mark.asyncio
+    async def test_subnet_order_does_not_affect_grouping(self, provider):
+        init_global_context("mrack.conf")
+        mock_subnets(
+            provider,
+            {
+                "subnet-a": MockSubnet(available=50),
+                "subnet-b": MockSubnet(available=80),
+            },
+        )
+
+        hosts = [
+            awshost("h1", ["subnet-a", "subnet-b"]),
+            awshost("h2", ["subnet-b", "subnet-a"]),
+        ]
+        await provider.validate_hosts(hosts)
+
+        assert hosts[0]["subnet_ids"] == ["subnet-b"]
+        assert hosts[1]["subnet_ids"] == ["subnet-b"]
+
+    @pytest.mark.asyncio
+    async def test_single_dedicated_subnet_untouched(self, provider):
+        init_global_context("mrack.conf")
+        mock_subnets(provider, {"subnet-a": MockSubnet(available=50)})
+
+        hosts = [awshost("h1", ["subnet-a"])]
+        await provider.validate_hosts(hosts)
+
+        assert hosts[0]["subnet_ids"] == ["subnet-a"]
+        provider.ec2.Subnet.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_big_request_no_spread_raises(self, provider):
+        init_global_context("mrack_no_spread.conf")
+        # Neither subnet alone can hold both hosts.
+        mock_subnets(
+            provider,
+            {
+                "subnet-a": MockSubnet(available=1),
+                "subnet-b": MockSubnet(available=1),
+            },
+        )
+
+        hosts = [
+            awshost("h1", ["subnet-a", "subnet-b"]),
+            awshost("h2", ["subnet-a", "subnet-b"]),
+        ]
+        with pytest.raises(ValidationError, match="Can not satisfy request"):
+            await provider.validate_hosts(hosts)
+
+    @pytest.mark.asyncio
+    async def test_big_request_allow_falls_back_to_spreading(self, provider):
+        init_global_context("mrack.conf")
+        # Neither subnet alone can hold both hosts, "allow" spreads instead.
+        mock_subnets(
+            provider,
+            {
+                "subnet-a": MockSubnet(available=1),
+                "subnet-b": MockSubnet(available=1),
+            },
+        )
+
+        hosts = [
+            awshost("h1", ["subnet-a", "subnet-b"]),
+            awshost("h2", ["subnet-a", "subnet-b"]),
+        ]
+        await provider.validate_hosts(hosts)
+
+        for host in hosts:
+            assert sorted(host["subnet_ids"]) == ["subnet-a", "subnet-b"]
+
+    @pytest.mark.asyncio
+    async def test_force_always_spreads(self, provider):
+        init_global_context("mrack_force_spread.conf")
+        # Both hosts would easily fit on subnet-b alone, but force must spread.
+        mock_subnets(
+            provider,
+            {
+                "subnet-a": MockSubnet(available=50),
+                "subnet-b": MockSubnet(available=80),
+            },
+        )
+
+        hosts = [
+            awshost("h1", ["subnet-a", "subnet-b"]),
+            awshost("h2", ["subnet-a", "subnet-b"]),
+        ]
+        await provider.validate_hosts(hosts)
+
+        for host in hosts:
+            assert sorted(host["subnet_ids"]) == ["subnet-a", "subnet-b"]

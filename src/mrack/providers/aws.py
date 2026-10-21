@@ -25,6 +25,7 @@ import boto3
 from botocore.exceptions import ClientError, NoCredentialsError, NoRegionError
 from dateutil import parser
 
+from mrack.context import global_context
 from mrack.errors import NotAuthenticatedError, ProvisioningError, ValidationError
 from mrack.host import STATUS_ACTIVE, STATUS_DELETED, STATUS_ERROR, STATUS_PROVISIONING
 from mrack.providers.provider import STRATEGY_ABORT, Provider
@@ -33,6 +34,16 @@ from mrack.utils import object2json
 logger = logging.getLogger(__name__)
 
 PROVISIONER_KEY = "aws"
+
+# number of usable IPs for a given subnet mask size (AWS reserves 5 addresses)
+SUBNET_MASK_SIZES = {
+    "28": 14,
+    "27": 30,
+    "26": 62,
+    "25": 126,
+    "24": 254,
+    "23": 510,
+}
 
 
 class AWSProvider(Provider):
@@ -248,7 +259,7 @@ class AWSProvider(Provider):
 
     async def validate_hosts(self, reqs):
         """Validate that host requirements are well specified."""
-        return
+        await self._resolve_subnet_groups(reqs)
 
     async def get_subnet_available_ips(self, subnet_id, log_msg_start):
         """Get number of IPs available in a subnet."""
@@ -266,6 +277,131 @@ class AWSProvider(Provider):
         )
 
         return subnet.available_ip_address_count
+
+    async def get_subnet_capacity(self, subnet_id, log_msg_start):
+        """Get available and total number of IPs in a subnet."""
+        try:
+            subnet = self.ec2.Subnet(subnet_id)
+            available = subnet.available_ip_address_count
+            total = SUBNET_MASK_SIZES.get(subnet.cidr_block.split("/")[-1], 0)
+        except ClientError:
+            logger.warning(
+                f"{log_msg_start} Error retrieving info from subnet: {subnet_id}"
+            )
+            return 0, 0
+
+        return available, total
+
+    async def _resolve_subnet_groups(self, hosts):
+        """Pick final subnet candidate(s) for hosts sharing multiple subnets.
+
+        Groups hosts whose 'subnet_ids' has more than one candidate by the
+        sorted tuple of those candidates (hosts with 0 or 1 candidate are
+        left untouched), and narrows each group's 'subnet_ids' down to one
+        subnet - or several, if spreading - based on the 'network-spread'
+        and 'usable-network-threshold' mrack.conf settings, the same ones
+        OpenStackProvider._get_usable_networks already uses.
+
+        Runs once in validate_hosts(), before the can_provision() retry
+        loop, so can_provision()/create_server() just operate on an
+        already-sized 'subnet_ids' list without needing any extra state.
+        """
+        log_msg_start = self.dsp_name
+
+        groups = {}
+        for host in hosts:
+            subnet_ids = host.get("subnet_ids")
+            if subnet_ids and len(subnet_ids) > 1:
+                groups.setdefault(tuple(sorted(subnet_ids)), []).append(host)
+
+        if not groups:
+            return
+
+        candidates = sorted({subnet_id for group in groups for subnet_id in group})
+        capacities = await asyncio.gather(
+            *[
+                self.get_subnet_capacity(subnet_id, log_msg_start)
+                for subnet_id in candidates
+            ]
+        )
+        capacity_by_subnet = dict(zip(candidates, capacities))
+
+        for group, group_hosts in groups.items():
+            chosen = self._pick_subnets_for_group(
+                group, len(group_hosts), capacity_by_subnet, log_msg_start
+            )
+            for host in group_hosts:
+                host["subnet_ids"] = list(chosen)
+
+    def _pick_subnets_for_group(
+        self, candidates, requested_ip_cnt, capacity_by_subnet, log_msg_start
+    ):
+        """Pick which subnet(s) a group of hosts sharing candidates should use.
+
+        Mirrors OpenStackProvider._get_usable_networks, operating over one
+        group's subnet candidates instead of a whole network-type pool.
+        """
+        threshold = global_context.CONFIG.usable_network_threshold
+        spread_option = global_context.CONFIG.network_spread
+
+        usable = set()
+        low_avail = set()
+        total_available = 0
+        max_size_subnet = 0
+
+        for subnet_id in candidates:
+            available, total = capacity_by_subnet[subnet_id]
+            max_size_subnet = max(max_size_subnet, available)
+
+            if not available:
+                continue
+
+            total_available += available
+
+            if total and (total - available) / total > threshold / 100:
+                low_avail.add((subnet_id, available))
+                continue
+
+            usable.add((subnet_id, available))
+
+        if not usable and total_available >= requested_ip_cnt and low_avail:
+            usable = usable.union(low_avail)
+
+        if not usable:
+            raise ValidationError(
+                f"{log_msg_start} No available subnets for {requested_ip_cnt} "
+                f"host(s) among {list(candidates)}"
+            )
+
+        big_request = requested_ip_cnt > max_size_subnet
+        if big_request:
+            usable = usable.union(low_avail)
+
+        size_for_spread = (
+            len(usable) if len(usable) <= requested_ip_cnt else requested_ip_cnt
+        )
+
+        subset_size = 0
+        if spread_option == "force":
+            subset_size = size_for_spread
+        elif spread_option == "no":
+            if not big_request:
+                subset_size = 1
+        else:  # spread option is allow or some unknown string -> fallback to default
+            if usable.intersection(low_avail) or big_request:
+                subset_size = size_for_spread
+            else:
+                subset_size = 1
+
+        if not subset_size:
+            raise ValidationError(
+                f"{log_msg_start} Can not satisfy request for {requested_ip_cnt} "
+                f"host(s) among {list(candidates)}. Change the 'network-spread' "
+                "in mrack.conf or try provisioning again later"
+            )
+
+        picked = sorted(usable, key=lambda u: u[1], reverse=True)[:subset_size]
+        return [subnet_id for subnet_id, _available in picked]
 
     async def can_provision(self, hosts):  # pylint: disable=too-many-branches
         """Check that all host can be provisioned.
@@ -337,18 +473,10 @@ class AWSProvider(Provider):
 
     async def utilization(self):
         """Check percentage utilization of given provider."""
-        net_sizes = {
-            "28": 14,
-            "27": 30,
-            "26": 62,
-            "25": 126,
-            "24": 254,
-            "23": 510,
-        }
         res = 0
         for net, _availability in self.subnets_capacity.items():
             subnet = self.ec2.Subnet(net)
-            size = net_sizes[subnet.cidr_block.split("/")[-1]]
+            size = SUBNET_MASK_SIZES[subnet.cidr_block.split("/")[-1]]
             self.subnets_capacity[net] = subnet.available_ip_address_count
             usage = (size - self.subnets_capacity[net]) / size * 100
             res = usage if usage > res else res

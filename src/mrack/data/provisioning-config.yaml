@@ -76,6 +76,9 @@ aws:  # aws provider config
     # Note: security_group and security_groups can be combined but at least 1 is required
 
     subnet_id: subnet-0ad1bab3a850e70fb  # subnet to use if default is not good
+    # When a host has multiple candidate subnet_ids, mrack.conf's
+    # network-spread/usable-network-threshold settings decide whether hosts
+    # of a job are pinned to one subnet or spread, same as for OpenStack.
 
     credentials_file: aws.key  # file containing the credentials
     profile: default  # credentials profile to use
